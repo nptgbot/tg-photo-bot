@@ -82,12 +82,12 @@ module.exports = async (req, res) => {
 
       // 2. 動態組合資訊（如果沒有 caption 就不會產生 💬 附加說明 這行）
       const detailInfoLines = [
-        `👤 **Post**：${senderName} (${senderUsername})`,
-        `⏰ **Time**：${sendTime}`
+        `👤 **P**：${senderName} (${senderUsername})`,
+        `⏰ **T**：${sendTime}`
       ];
 
       if (caption.trim()) {
-        detailInfoLines.push(`💬 **C.**：${caption.trim()}`);
+        detailInfoLines.push(`💬 **C**：${caption.trim()}`);
       }
 
       const detailInfo = detailInfoLines.join('\n');
