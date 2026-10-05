@@ -92,24 +92,25 @@ module.exports = async (req, res) => {
       // 如果是「多圖/多影片連發 (Media Group)」
       if (mediaGroupId) {
         const groupKey = `album:${mediaGroupId}`;
-        const groupLockKey = `album_lock:${mediaGroupId}`;
+        const counterKey = `album_count:${mediaGroupId}`;
 
-        // 將這張圖片/影片的資料放入 Redis 的 Array 列表中
+        // 1. 將這張圖片/影片寫入 Redis 列表
         await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
-        await redis.expire(groupKey, 86400); // 設置 1 天過期防殘留
+        await redis.expire(groupKey, 86400);
 
-        // 使用 Redis 鎖定機制，確保只由「第一個接收到的請求」負責最終處理與發文
-        const isFirst = await redis.set(groupLockKey, 'locked', { nx: true, ex: 10 });
+        // 2. 利用原子遞增 (INCR) 鎖定，只有第一個到達的請求 (count === 1) 會負責最終發文
+        const count = await redis.incr(counterKey);
+        await redis.expire(counterKey, 30);
 
-        if (isFirst) {
-          // 等待 1.5 秒讓 Telegram 把整組相簿的圖片都傳完
-          await sleep(1500);
+        if (count === 1) {
+          // 💡 等待 2.5 秒，確保 8~10 張圖片的 Webhook 請求都完整傳入並寫入 Redis
+          await sleep(2500);
 
-          // 讀取這組相冊收集到的所有多媒體資料
+          // 讀取相冊中累積的所有圖片/影片
           const rawItems = await redis.lrange(groupKey, 0, -1);
           const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-          // 尋找相冊中帶有 caption 的文字說明（Telegram 通常只放在第一張）
+          // 尋找相冊中帶有 caption 的文字說明（Telegram 通常附在第一張）
           const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
 
           const mediaToken = Math.random().toString(36).substring(2, 10);
@@ -117,7 +118,7 @@ module.exports = async (req, res) => {
           // 💡 將整組媒體 Array 寫入 Redis，永久保存
           await redis.set(mediaToken, { isGroup: true, items });
 
-          // 動態組合資訊（如果是 Admin 匿名發文，則不顯示 P: 行）
+          // 動態組合資訊
           const detailInfoLines = [];
           if (!isAnonymousAdmin) {
             detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
@@ -131,7 +132,7 @@ module.exports = async (req, res) => {
           const detailInfo = detailInfoLines.join('\n');
           let channelMsgLink = BACKUP_CHANNEL_URL;
 
-          // 同步備份整個相冊至私人頻道
+          // 同步備份整組相冊至私人頻道
           if (BACKUP_CHANNEL_ID && items.length > 0) {
             try {
               const mediaGroupPayload = items.map((item, index) => ({
@@ -153,7 +154,7 @@ module.exports = async (req, res) => {
           const me = await bot.getMe();
           const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-          // 發送群組統一按鈕（只會發送一條訊息）
+          // 發送群組統一按鈕（只會發送「唯一一條」訊息）
           await bot.sendMessage(chatId, detailInfo, {
             parse_mode: 'Markdown',
             reply_markup: {
@@ -169,7 +170,7 @@ module.exports = async (req, res) => {
 
           // 清理相冊快取 Key
           await redis.del(groupKey);
-          await redis.del(groupLockKey);
+          await redis.del(counterKey);
         }
       } 
       // 如果是「單張圖片或單個影片」
@@ -179,7 +180,7 @@ module.exports = async (req, res) => {
         // 寫入單一媒體項目，永久保存
         await redis.set(mediaToken, { isGroup: false, fileId, type });
 
-        // 動態組合資訊（如果是 Admin 匿名發文，則不顯示 P: 行）
+        // 動態組合資訊
         const detailInfoLines = [];
         if (!isAnonymousAdmin) {
           detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
