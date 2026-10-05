@@ -34,6 +34,8 @@ function formatTimestamp(unixTimestamp) {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // 檢查用戶是否已訂閱頻道
 async function checkSubscription(userId) {
   try {
@@ -76,27 +78,6 @@ module.exports = async (req, res) => {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 💡 檢測到多圖/影片上載時：攔截後續檔案，僅放行第一個檔案並跳出提示
-      if (msg.media_group_id) {
-        const groupKey = `mg:${chatId}_${msg.media_group_id}`;
-        // 利用 Redis 判斷是否為同一次上載的第一個 Message
-        const isFirst = await redis.set(groupKey, '1', { nx: true, ex: 10 });
-
-        if (!isFirst) {
-          // 非第一個檔案直接丟棄不處理
-          return res.status(200).send('OK');
-        }
-
-        // 發送提示訊息（只發送一次）
-        bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。').then(warnMsg => {
-          // 💡 10 秒後自動刪除提示訊息
-          setTimeout(async () => {
-            try { await bot.deleteMessage(chatId, warnMsg.message_id); } catch (e) {}
-          }, 10000);
-        }).catch(() => {});
-      }
-
-      // 處理第一個檔案（或單檔上載）
       let fileId = '';
       let type = 'photo';
 
@@ -108,26 +89,20 @@ module.exports = async (req, res) => {
         fileId = msg.video.file_id;
       }
 
-      const mediaToken = Math.random().toString(36).substring(2, 10);
-      
-      // 寫入 Redis 供私聊「密看」讀取
-      await redis.set(mediaToken, { fileId, type }, { ex: 86400 });
-
-      // 組合訊息資訊
+      // 💡 移除標籤前綴，直接顯示文字內容
       const detailInfoLines = [];
-      if (!isAnonymousAdmin) {
-        detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
-      }
-      detailInfoLines.push(`⏰ **T**：${sendTime}`);
-
       if (caption.trim()) {
-        detailInfoLines.push(`💬 **C**：${caption.trim()}`);
+        detailInfoLines.push(`${caption.trim()}`);
       }
+      if (!isAnonymousAdmin) {
+        detailInfoLines.push(`${senderName} (${senderUsername})`);
+      }
+      detailInfoLines.push(`${sendTime}`);
 
       const detailInfo = detailInfoLines.join('\n');
       let channelMsgLink = BACKUP_CHANNEL_URL;
 
-      // 轉發私人頻道備份
+      // 備份至私人頻道
       if (BACKUP_CHANNEL_ID) {
         try {
           let backupMsg;
@@ -142,10 +117,26 @@ module.exports = async (req, res) => {
         }
       }
 
+      // 多圖判斷與提示處理
+      let isFirstInGroup = true;
+      if (msg.media_group_id) {
+        const groupKey = `mg:${chatId}_${msg.media_group_id}`;
+        isFirstInGroup = await redis.set(groupKey, '1', { nx: true, ex: 10 });
+      }
+
+      // 多圖中非第一個檔案僅完成備份，不再發送群組按鈕
+      if (!isFirstInGroup) {
+        return res.status(200).send('OK');
+      }
+
+      // 第一個檔案：寫入 Redis 供「密看」讀取
+      const mediaToken = Math.random().toString(36).substring(2, 10);
+      await redis.set(mediaToken, { fileId, type }, { ex: 86400 });
+
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 群組發送按鈕
+      // 發送群組按鈕訊息
       await bot.sendMessage(chatId, detailInfo, {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -158,6 +149,17 @@ module.exports = async (req, res) => {
           ]
         }
       });
+
+      // 多圖時發送提示，並於 10 秒後刪除提示訊息
+      if (msg.media_group_id) {
+        try {
+          const warnMsg = await bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。');
+          await sleep(10000);
+          await bot.deleteMessage(chatId, warnMsg.message_id);
+        } catch (e) {
+          console.error('刪除提示訊息失敗:', e.message);
+        }
+      }
     }
 
     // 處理私聊 /start (點擊密看)
@@ -195,11 +197,10 @@ module.exports = async (req, res) => {
         sentMsg = await bot.sendPhoto(chatId, data.fileId, { caption: privateCaption, protect_content: true });
       }
 
-      // 定時自動銷毀
+      // 私聊定時自動銷毀
       if (sentMsg) {
-        setTimeout(async () => {
-          try { await bot.deleteMessage(chatId, sentMsg.message_id); } catch (e) {}
-        }, DELETE_DELAY_SECONDS * 1000);
+        await sleep(DELETE_DELAY_SECONDS * 1000);
+        try { await bot.deleteMessage(chatId, sentMsg.message_id); } catch (e) {}
       }
     }
   } catch (err) {
