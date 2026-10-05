@@ -140,31 +140,19 @@ module.exports = async (req, res) => {
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 4. 發送群組按鈕（只會發送一次）
+      // 4. 發送群組按鈕（只會發送一次，不帶任何提示訊息）
       await bot.sendMessage(chatId, detailInfo, {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
             [
-              { text: '👁 看圖', url: startUrl },
+              { text: '👁 密看', url: startUrl },
               { text: '💬 入谷', url: APPLY_GROUP_URL },
               { text: '🍔 谷睇', url: channelMsgLink }
             ]
           ]
         }
       });
-
-      // 5. 多圖時發送提示，並非阻塞地在 2 秒後刪除提示訊息
-      if (msg.media_group_id) {
-        bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。').then(async (warnMsg) => {
-          if (warnMsg && warnMsg.message_id) {
-            await sleep(2000);
-            try {
-              await bot.deleteMessage(chatId, warnMsg.message_id);
-            } catch (e) {}
-          }
-        }).catch(() => {});
-      }
     }
 
     // 處理私聊 /start (點擊密看)
