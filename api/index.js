@@ -80,16 +80,18 @@ module.exports = async (req, res) => {
       const mediaToken = Math.random().toString(36).substring(2, 10);
       
       // 💡 寫入 Redis 資料庫（保存 365 天 = 31536000 秒）
-      await redis.set(mediaToken, { fileId, type }, { ex: 31536000 });
+      // await redis.set(mediaToken, { fileId, type }, { ex: 315360000 });
+      // 💡 完全不設期限（永久保存）
+      await redis.set(mediaToken, { fileId, type });
 
       // 2. 動態組合資訊
       const detailInfoLines = [
-        `👤 **Post**：${senderName} (${senderUsername})`,
-        `⏰ **Time**：${sendTime}`
+        `👤 **P**：${senderName} (${senderUsername})`,
+        `⏰ **T**：${sendTime}`
       ];
 
       if (caption.trim()) {
-        detailInfoLines.push(`💬 **C.**：${caption.trim()}`);
+        detailInfoLines.push(`💬 **C**：${caption.trim()}`);
       }
 
       const detailInfo = detailInfoLines.join('\n');
@@ -160,7 +162,7 @@ module.exports = async (req, res) => {
       if (!item) {
         await bot.sendMessage(chatId, '❌ 該檔案已過期或已被清理。');
       } else {
-        const privateCaption = `🔒 內容將在 ${DELETE_DELAY_SECONDS} 秒後自動銷毀！禁止轉發與截圖。`;
+        const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後毀！`;
         let sentMsg;
 
         if (item.type === 'photo') {
