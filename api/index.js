@@ -157,7 +157,7 @@ module.exports = async (req, res) => {
       if (!item) {
         await bot.sendMessage(chatId, '❌ 該檔案已過期或已被清理。');
       } else {
-        const privateCaption = `🔒 內容將在 ${DELETE_DELAY_SECONDS} 秒後自動銷毀！禁止轉發與截圖。`;
+        const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後自銷毀！`;
         let sentMsg;
 
         if (item.type === 'photo') {
