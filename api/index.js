@@ -82,12 +82,12 @@ module.exports = async (req, res) => {
 
       // 2. 動態組合資訊（如果沒有 caption 就不會產生 💬 附加說明 這行）
       const detailInfoLines = [
-        `👤 **發布者**：${senderName} (${senderUsername})`,
-        `⏰ **發布時間**：${sendTime}`
+        `👤 **Post**：${senderName} (${senderUsername})`,
+        `⏰ **Time**：${sendTime}`
       ];
 
       if (caption.trim()) {
-        detailInfoLines.push(`💬 **附加說明**：${caption.trim()}`);
+        detailInfoLines.push(`💬 **C.**：${caption.trim()}`);
       }
 
       const detailInfo = detailInfoLines.join('\n');
@@ -127,7 +127,7 @@ module.exports = async (req, res) => {
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
       // 5. 組合群組內的提示訊息（已移除美食相片收集器標頭）
-      const groupResponseText = `${detailInfo}\n\n睇相睇片請按下面按鍵：`;
+      const groupResponseText = `${detailInfo}`;
 
       await bot.sendMessage(
         chatId,
@@ -137,9 +137,9 @@ module.exports = async (req, res) => {
           reply_markup: {
             inline_keyboard: [
               [
-                { text: '👁️ 私睇', url: startUrl },
+                { text: '👁️ 爽看', url: startUrl },
                 { text: '💬 入谷', url: APPLY_GROUP_URL },
-                { text: '🍔 谷睇...', url: channelMsgLink }
+                { text: '🍔 谷睇', url: channelMsgLink }
               ]
             ]
           }
