@@ -171,7 +171,7 @@ module.exports = async (req, res) => {
             reply_markup: {
               inline_keyboard: [
                 [
-                  { text: '👁️ 爽看', url: startUrl },
+                  { text: '👁️ 密看', url: startUrl },
                   { text: '💬 入谷', url: APPLY_GROUP_URL },
                   { text: '🍔 谷睇', url: channelMsgLink }
                 ]
