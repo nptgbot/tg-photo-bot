@@ -9,7 +9,7 @@ const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '-1004320576547';
 // 💡 2. 申請入谷連結
 const APPLY_GROUP_URL = process.env.APPLY_GROUP_URL || 'https://t.me/+rz1gdgLB7dtlYWE1'; 
 
-// 💡 3. 私人頻道通用邀請連結 (請替換為你的頻道邀請碼)
+// 💡 3. 私人頻道通用邀請連結
 const BACKUP_CHANNEL_URL = process.env.BACKUP_CHANNEL_URL || 'https://t.me/+your_channel_invite_link'; 
 
 const bot = new TelegramBot(token);
@@ -23,6 +23,20 @@ function getChannelMessageLink(channelId, messageId) {
   if (!channelId) return BACKUP_CHANNEL_URL;
   const cleanId = channelId.toString().replace('-100', '');
   return `https://t.me/c/${cleanId}/${messageId}`;
+}
+
+// 輔助函式：格式化時間 (轉為 YYYY-MM-DD HH:mm 格式)
+function formatTimestamp(unixTimestamp) {
+  const date = new Date(unixTimestamp * 1000);
+  const utc8Date = new Date(date.getTime() + (8 * 60 + date.getTimezoneOffset()) * 60000);
+  
+  const year = utc8Date.getFullYear();
+  const month = String(utc8Date.getMonth() + 1).padStart(2, '0');
+  const day = String(utc8Date.getDate()).padStart(2, '0');
+  const hours = String(utc8Date.getHours()).padStart(2, '0');
+  const minutes = String(utc8Date.getMinutes()).padStart(2, '0');
+  
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
 module.exports = async (req, res) => {
@@ -44,7 +58,13 @@ module.exports = async (req, res) => {
     if (msg && (msg.photo || msg.video)) {
       const chatId = msg.chat.id;
       const messageId = msg.message_id;
-      const caption = msg.caption || ''; // 讀取附帶文字
+      const caption = msg.caption || ''; // 讀取發圖者的文字
+
+      // 1. 抓取發送者資訊
+      const sender = msg.from;
+      const senderName = [sender.first_name, sender.last_name].filter(Boolean).join(' ') || '未知用戶';
+      const senderUsername = sender.username ? `@${sender.username}` : '無用戶名';
+      const sendTime = formatTimestamp(msg.date);
 
       let fileId = '';
       let type = 'photo';
@@ -60,20 +80,34 @@ module.exports = async (req, res) => {
       const mediaToken = Math.random().toString(36).substring(2, 10);
       mediaStore.set(mediaToken, { fileId, type });
 
+      // 2. 動態組合資訊（如果沒有 caption 就不會產生 💬 附加說明 這行）
+      const detailInfoLines = [
+        `👤 **發布者**：${senderName} (${senderUsername})`,
+        `⏰ **發布時間**：${sendTime}`
+      ];
+
+      if (caption.trim()) {
+        detailInfoLines.push(`💬 **附加說明**：${caption.trim()}`);
+      }
+
+      const detailInfo = detailInfoLines.join('\n');
+
       let channelMsgLink = BACKUP_CHANNEL_URL;
 
-      // 1. 同步備份至私人頻道，並取得專屬貼文跳轉連結
+      // 3. 同步備份至私人頻道（附帶動態詳細資料，不顯示收集器標頭）
       if (BACKUP_CHANNEL_ID) {
         try {
+          const channelCaption = detailInfo;
           let backupMsg;
+
           if (type === 'photo') {
             backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, fileId, {
-              caption: caption ? `${caption}\n\n👉 歸檔備份` : '👉 歸檔備份',
+              caption: channelCaption,
               parse_mode: 'Markdown'
             });
           } else if (type === 'video') {
             backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, fileId, {
-              caption: caption ? `${caption}\n\n👉 歸檔備份` : '👉 歸檔備份',
+              caption: channelCaption,
               parse_mode: 'Markdown'
             });
           }
@@ -82,25 +116,22 @@ module.exports = async (req, res) => {
             channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
           }
         } catch (e) {
-          console.error('轉發私人頻道失敗 (請確認 Bot 已設為頻道管理員):', e.message);
+          console.error('轉發私人頻道失敗:', e.message);
         }
       }
 
-      // 2. 刪除原群組多媒體訊息
+      // 4. 刪除原群組多媒體訊息
       await bot.deleteMessage(chatId, messageId);
 
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 3. 組合三按鈕提示訊息
-      let responseText = `📸 **【美食相片收集器】**\n睇相睇片請按下面按鍵：\n`;
-      if (caption) {
-        responseText += `\n${caption}`;
-      }
+      // 5. 組合群組內的提示訊息（已移除美食相片收集器標頭）
+      const groupResponseText = `${detailInfo}\n\n睇相睇片請按下面按鍵：`;
 
       await bot.sendMessage(
         chatId,
-        responseText,
+        groupResponseText,
         {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -116,7 +147,7 @@ module.exports = async (req, res) => {
       );
     }
 
-    // 處理私聊 /start (即時直接跳出圖/影片)
+    // 處理私聊 /start (即時跳出圖片/影片)
     if (msg && msg.text && msg.text.startsWith('/start ')) {
       const chatId = msg.chat.id;
       const mediaToken = msg.text.split(' ')[1];
