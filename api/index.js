@@ -76,35 +76,32 @@ module.exports = async (req, res) => {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 💡 【核心修復】使用「滑動時間視窗」取代死板的除以 10 區塊
+      // 使用滑動視窗聚合多媒體
       let groupKeyId = msg.media_group_id;
       const sessionKey = `sess:${chatId}_${senderId}`;
 
-      // 如果 Telegram 沒有提供 media_group_id，我們自己建立自動延長的群組
       if (!groupKeyId) {
         groupKeyId = await redis.get(sessionKey);
         if (!groupKeyId) {
           groupKeyId = `batch_${Date.now()}`;
         }
-        // 只要 5 秒內有新圖傳進來，就會自動重置計時器並歸入同一組
         await redis.set(sessionKey, groupKeyId, { ex: 5 });
       }
 
       const groupKey = `album:${groupKeyId}`;
       const lockKey = `lock:${groupKeyId}`;
 
-      // 1. 推入 Redis 並確保資料安全保留
+      // 1. 推入 Redis
       await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
       await redis.expire(groupKey, 86400);
 
-      // 2. 選出唯一負責發送的「主控請求」
+      // 2. 鎖定主控端
       const isMaster = await redis.set(lockKey, 'locked', { nx: true, ex: 15 });
 
       if (isMaster) {
-        // 主控端單純等待 4 秒鐘，讓背後其他圖片全都裝進同一個 Redis 箱子
+        // 等待 4 秒讓所有圖片傳完
         await sleep(4000);
 
-        // 如果是我們自己建的 Session，提前關閉它，確保未來的圖不會混進來
         if (!msg.media_group_id) {
           const currentSession = await redis.get(sessionKey);
           if (currentSession === groupKeyId) {
@@ -112,21 +109,20 @@ module.exports = async (req, res) => {
           }
         }
 
-        // 一口氣把 4 秒內收集到的所有圖拿出來
+        // 讀取所有圖片
         const rawItems = await redis.lrange(groupKey, 0, -1);
         if (!rawItems || rawItems.length === 0) return res.status(200).send('OK');
 
         const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-        // 自動掃描並抓取那一張有文字的 C:
         const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
 
         const mediaToken = Math.random().toString(36).substring(2, 10);
         
-        // 寫入 Redis 供私聊「爽看」 (記錄是否為多圖)
+        // 💡 關鍵修復：在 4 秒收集完成後，正確寫入 isGroup 與完整的 items 陣列！
         await redis.set(mediaToken, { 
           isGroup: items.length > 1, 
-          items, 
+          items: items, 
           fileId: items[0].fileId, 
           type: items[0].type 
         });
@@ -174,7 +170,6 @@ module.exports = async (req, res) => {
         const me = await bot.getMe();
         const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-        // 🌟 最終保證：只發送唯一一條整合好的按鈕訊息！
         await bot.sendMessage(chatId, detailInfo, {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -188,11 +183,11 @@ module.exports = async (req, res) => {
           }
         });
 
-        // 處理完畢清空箱子
         await redis.del(groupKey);
       }
     }
 
+    // 處理私聊 /start
     if (msg && msg.text && msg.text.startsWith('/start ')) {
       const chatId = msg.chat.id;
       const mediaToken = msg.text.split(' ')[1];
@@ -205,7 +200,8 @@ module.exports = async (req, res) => {
         const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後毀！`;
         let sentMessages = [];
 
-        if (data.isGroup && Array.isArray(data.items)) {
+        // 💡 讀取 items 發送多圖 Media Group
+        if (data.isGroup && Array.isArray(data.items) && data.items.length > 1) {
           const mediaGroupPayload = data.items.map((item, index) => ({
             type: item.type,
             media: item.fileId,
@@ -216,13 +212,16 @@ module.exports = async (req, res) => {
           sentMessages = await bot.sendMediaGroup(chatId, mediaGroupPayload);
         } else {
           let sentMsg;
-          if (data.type === 'photo') {
-            sentMsg = await bot.sendPhoto(chatId, data.fileId, {
+          const targetFileId = data.fileId || (data.items && data.items[0]?.fileId);
+          const targetType = data.type || (data.items && data.items[0]?.type) || 'photo';
+
+          if (targetType === 'photo') {
+            sentMsg = await bot.sendPhoto(chatId, targetFileId, {
               caption: privateCaption,
               protect_content: true
             });
-          } else if (data.type === 'video') {
-            sentMsg = await bot.sendVideo(chatId, data.fileId, {
+          } else if (targetType === 'video') {
+            sentMsg = await bot.sendVideo(chatId, targetFileId, {
               caption: privateCaption,
               protect_content: true
             });
@@ -230,6 +229,7 @@ module.exports = async (req, res) => {
           if (sentMsg) sentMessages.push(sentMsg);
         }
 
+        // 定時銷毀
         setTimeout(async () => {
           for (const m of sentMessages) {
             try {
