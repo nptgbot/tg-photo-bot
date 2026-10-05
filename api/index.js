@@ -1,4 +1,8 @@
 const TelegramBot = require('node-telegram-bot-api');
+const { Redis } = require('@upstash/redis');
+
+// 自動讀取 Vercel 與 Upstash 連線環境變數
+const redis = Redis.fromEnv();
 
 const token = process.env.BOT_TOKEN || '8894128453:AAHqR_BaE_WN00CKugjh_hqg79dbX_B5iKY';
 const DELETE_DELAY_SECONDS = parseInt(process.env.DELETE_DELAY || '15', 10);
@@ -13,10 +17,6 @@ const APPLY_GROUP_URL = process.env.APPLY_GROUP_URL || 'https://t.me/+rz1gdgLB7d
 const BACKUP_CHANNEL_URL = process.env.BACKUP_CHANNEL_URL || 'https://t.me/+your_channel_invite_link'; 
 
 const bot = new TelegramBot(token);
-
-// 全域記憶體儲存 (支援 photo 與 video)
-const mediaStore = global.mediaStore || new Map();
-global.mediaStore = mediaStore;
 
 // 輔助函式：將 -100XXXXXX 轉為 Telegram 頻道內部跳轉連結格式
 function getChannelMessageLink(channelId, messageId) {
@@ -78,23 +78,25 @@ module.exports = async (req, res) => {
       }
 
       const mediaToken = Math.random().toString(36).substring(2, 10);
-      mediaStore.set(mediaToken, { fileId, type });
+      
+      // 💡 寫入 Redis 資料庫（保存 365 天 = 31536000 秒）
+      await redis.set(mediaToken, { fileId, type }, { ex: 31536000 });
 
-      // 2. 動態組合資訊（如果沒有 caption 就不會產生 💬 附加說明 這行）
+      // 2. 動態組合資訊
       const detailInfoLines = [
-        `👤 **P**：${senderName} (${senderUsername})`,
-        `⏰ **T**：${sendTime}`
+        `👤 **Post**：${senderName} (${senderUsername})`,
+        `⏰ **Time**：${sendTime}`
       ];
 
       if (caption.trim()) {
-        detailInfoLines.push(`💬 **C**：${caption.trim()}`);
+        detailInfoLines.push(`💬 **C.**：${caption.trim()}`);
       }
 
       const detailInfo = detailInfoLines.join('\n');
 
       let channelMsgLink = BACKUP_CHANNEL_URL;
 
-      // 3. 同步備份至私人頻道（附帶動態詳細資料，不顯示收集器標頭）
+      // 3. 同步備份至私人頻道
       if (BACKUP_CHANNEL_ID) {
         try {
           const channelCaption = detailInfo;
@@ -126,7 +128,7 @@ module.exports = async (req, res) => {
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 5. 組合群組內的提示訊息（已移除美食相片收集器標頭）
+      // 5. 組合群組內的提示訊息
       const groupResponseText = `${detailInfo}`;
 
       await bot.sendMessage(
@@ -152,12 +154,13 @@ module.exports = async (req, res) => {
       const chatId = msg.chat.id;
       const mediaToken = msg.text.split(' ')[1];
 
-      const item = mediaStore.get(mediaToken);
+      // 💡 從 Redis 讀取資料
+      const item = await redis.get(mediaToken);
 
       if (!item) {
         await bot.sendMessage(chatId, '❌ 該檔案已過期或已被清理。');
       } else {
-        const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後自銷毀！`;
+        const privateCaption = `🔒 內容將在 ${DELETE_DELAY_SECONDS} 秒後自動銷毀！禁止轉發與截圖。`;
         let sentMsg;
 
         if (item.type === 'photo') {
