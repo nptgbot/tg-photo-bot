@@ -73,103 +73,117 @@ module.exports = async (req, res) => {
         fileId = msg.video.file_id;
       }
 
-      // 先刪除原圖
+      // 先刪除原圖訊息
       try {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 💡 關鍵改變：優先使用 media_group_id，若無則降級為 「chatId + senderId + 時間區段(以10秒為單位)」
-      const timeBlock = Math.floor(msg.date / 5); // 5秒的時間視窗
+      // 1. 生成相冊獨立 Key（優先使用 media_group_id，否則以 10 秒區間聚合）
+      const timeBlock = Math.floor(msg.date / 10);
       const groupKeyId = msg.media_group_id || `${chatId}_${senderId}_${timeBlock}`;
       
       const groupKey = `album:${groupKeyId}`;
-      const counterKey = `album_count:${groupKeyId}`;
+      const lastUpdateKey = `album_last:${groupKeyId}`;
+      const processLockKey = `album_proc:${groupKeyId}`;
 
-      // 1. 推入 Redis
+      // 2. 將這張圖片推入 Redis List，並記錄「最後更新時間」
+      const now = Date.now();
       await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
-      await redis.expire(groupKey, 86400);
+      await redis.set(lastUpdateKey, now);
+      await redis.expire(groupKey, 3600);
+      await redis.expire(lastUpdateKey, 3600);
 
-      // 2. 只有第一個請求發文
-      const count = await redis.incr(counterKey);
-      await redis.expire(counterKey, 15);
+      // 3. 嘗試取得處理鎖 (Set NX)，只有拿到的那個請求會負責監控與發文
+      const acquiredLock = await redis.set(processLockKey, 'processing', { nx: true, ex: 60 });
 
-      if (count === 1) {
-        // 等待 2.5 秒，讓同一次上傳的所有圖片（包含匿名發圖）全部收集進 Redis
-        await sleep(2500);
+      if (acquiredLock) {
+        // 進入 Debounce 輪詢：直到 2.0 秒內沒有任何新的圖片進來為止
+        while (true) {
+          await sleep(2000);
+          const lastTime = await redis.get(lastUpdateKey);
+          if (!lastTime || Date.now() - parseInt(lastTime, 10) >= 1800) {
+            // 已經超過 1.8 秒沒有新圖片寫入，表示這組相冊全部接收完成！
+            break;
+          }
+        }
 
+        // 讀取相冊中收集到的所有多媒體資料
         const rawItems = await redis.lrange(groupKey, 0, -1);
         const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-        // 自動掃描所有圖片，找出那張有帶 C: 文字的圖片
-        const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
+        if (items && items.length > 0) {
+          // 找出含有 C: 文字說明的相片
+          const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
 
-        const mediaToken = Math.random().toString(36).substring(2, 10);
-        
-        // 寫入 Redis 供私聊「爽看」
-        await redis.set(mediaToken, { isGroup: items.length > 1, items, fileId: items[0].fileId, type: items[0].type });
+          const mediaToken = Math.random().toString(36).substring(2, 10);
+          
+          // 寫入 Redis 供私聊「爽看」
+          await redis.set(mediaToken, { isGroup: items.length > 1, items, fileId: items[0].fileId, type: items[0].type });
 
-        // 組合訊息資訊
-        const detailInfoLines = [];
-        if (!isAnonymousAdmin) {
-          detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
-        }
-        detailInfoLines.push(`⏰ **T**：${sendTime}`);
+          // 組合資訊
+          const detailInfoLines = [];
+          if (!isAnonymousAdmin) {
+            detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
+          }
+          detailInfoLines.push(`⏰ **T**：${sendTime}`);
 
-        if (finalCaption.trim()) {
-          detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
-        }
+          if (finalCaption.trim()) {
+            detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
+          }
 
-        const detailInfo = detailInfoLines.join('\n');
-        let channelMsgLink = BACKUP_CHANNEL_URL;
+          const detailInfo = detailInfoLines.join('\n');
+          let channelMsgLink = BACKUP_CHANNEL_URL;
 
-        // 同步備份至私人頻道
-        if (BACKUP_CHANNEL_ID && items.length > 0) {
-          try {
-            if (items.length > 1) {
-              const mediaGroupPayload = items.map((item, index) => ({
-                type: item.type,
-                media: item.fileId,
-                caption: index === 0 ? detailInfo : '',
-                parse_mode: 'Markdown'
-              }));
-              const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
-              if (backupMsgs && backupMsgs.length > 0) {
-                channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
-              }
-            } else {
-              let backupMsg;
-              if (items[0].type === 'photo') {
-                backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+          // 同步轉發至私人頻道
+          if (BACKUP_CHANNEL_ID) {
+            try {
+              if (items.length > 1) {
+                const mediaGroupPayload = items.map((item, index) => ({
+                  type: item.type,
+                  media: item.fileId,
+                  caption: index === 0 ? detailInfo : '',
+                  parse_mode: 'Markdown'
+                }));
+                const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
+                if (backupMsgs && backupMsgs.length > 0) {
+                  channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
+                }
               } else {
-                backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+                let backupMsg;
+                if (items[0].type === 'photo') {
+                  backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+                } else {
+                  backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+                }
+                if (backupMsg) channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
               }
-              if (backupMsg) channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
+            } catch (e) {
+              console.error('轉發私人頻道失敗:', e.message);
             }
-          } catch (e) {
-            console.error('轉發私人頻道失敗:', e.message);
           }
+
+          const me = await bot.getMe();
+          const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
+
+          // 發送群組唯一的按鈕訊息
+          await bot.sendMessage(chatId, detailInfo, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '👁️ 爽看', url: startUrl },
+                  { text: '💬 入谷', url: APPLY_GROUP_URL },
+                  { text: '🍔 谷睇', url: channelMsgLink }
+                ]
+              ]
+            }
+          });
         }
 
-        const me = await bot.getMe();
-        const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
-
-        // 發送群組唯一的按鈕訊息
-        await bot.sendMessage(chatId, detailInfo, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '👁️ 爽看', url: startUrl },
-                { text: '💬 入谷', url: APPLY_GROUP_URL },
-                { text: '🍔 谷睇', url: channelMsgLink }
-              ]
-            ]
-          }
-        });
-
-        // 清除快取
+        // 徹底清理這些鍵值，防重複觸發
         await redis.del(groupKey);
-        await redis.del(counterKey);
+        await redis.del(lastUpdateKey);
+        await redis.del(processLockKey);
       }
     }
 
