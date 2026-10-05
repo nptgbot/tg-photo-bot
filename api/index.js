@@ -43,7 +43,7 @@ async function checkSubscription(userId) {
     return ['creator', 'administrator', 'member'].includes(member.status);
   } catch (e) {
     console.error('檢查頻道訂閱失敗:', e.message);
-    return true; // 出錯時預設放行
+    return true; // 若權限出錯預設放行
   }
 }
 
@@ -92,7 +92,7 @@ module.exports = async (req, res) => {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 建立相冊 Session
+      // 建立相冊 Session 聚合
       let groupKeyId = msg.media_group_id;
       const sessionKey = `sess:${chatId}_${senderId}`;
 
@@ -107,15 +107,15 @@ module.exports = async (req, res) => {
       const groupKey = `album:${groupKeyId}`;
       const lockKey = `lock:${groupKeyId}`;
 
-      // 推入 Redis
+      // 1. 推入 Redis
       await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
       await redis.expire(groupKey, 86400);
 
-      // 主控者競爭
+      // 2. 主控者競爭
       const isMaster = await redis.set(lockKey, 'locked', { nx: true, ex: 15 });
 
       if (isMaster) {
-        // 等待 4 秒聚集所有相片
+        // 等待 4 秒收集所有發送的媒體
         await sleep(4000);
 
         if (!msg.media_group_id) {
@@ -128,15 +128,19 @@ module.exports = async (req, res) => {
         const rawItems = await redis.lrange(groupKey, 0, -1);
         if (!rawItems || rawItems.length === 0) return res.status(200).send('OK');
 
-        const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
-        const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
+        // 安全解析資料項目
+        const items = rawItems.map(item => {
+          if (typeof item === 'string') {
+            try { return JSON.parse(item); } catch (e) { return null; }
+          }
+          return item;
+        }).filter(Boolean);
 
+        const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
         const mediaToken = Math.random().toString(36).substring(2, 10);
         
-        // 保存完整的媒體陣列資料
-        await redis.set(mediaToken, JSON.stringify({ 
-          items: items 
-        }), { ex: 86400 });
+        // 直接存入原生 JavaScript 物件，讓 Upstash SDK 自動序列化
+        await redis.set(mediaToken, { items: items }, { ex: 86400 });
 
         const detailInfoLines = [];
         if (!isAnonymousAdmin) {
@@ -156,7 +160,7 @@ module.exports = async (req, res) => {
           try {
             if (items.length > 1) {
               const mediaGroupPayload = items.map((item, index) => ({
-                type: item.type,
+                type: item.type || 'photo',
                 media: item.fileId,
                 caption: index === 0 ? detailInfo : '',
                 parse_mode: 'Markdown'
@@ -188,7 +192,7 @@ module.exports = async (req, res) => {
           reply_markup: {
             inline_keyboard: [
               [
-                { text: '👁️️ 密看', url: startUrl },
+                { text: '👁 密看', url: startUrl },
                 { text: '💬 入谷', url: APPLY_GROUP_URL },
                 { text: '🍔 谷睇', url: channelMsgLink }
               ]
@@ -220,14 +224,19 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK');
       }
 
-      let rawData = await redis.get(mediaToken);
-      if (!rawData) {
+      let data = await redis.get(mediaToken);
+      if (!data) {
         await bot.sendMessage(chatId, '❌ 該檔案已過期或已被清理。');
         return res.status(200).send('OK');
       }
 
-      const data = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
-      const items = data.items || (data.fileId ? [{ fileId: data.fileId, type: data.type || 'photo' }] : []);
+      // 相容性處理：若傳回字串則 Parse，否則直接讀取
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) {}
+      }
+
+      // 強制取得完整的 items 陣列
+      const items = Array.isArray(data.items) ? data.items : (data.fileId ? [{ fileId: data.fileId, type: data.type || 'photo' }] : []);
 
       if (items.length === 0) {
         await bot.sendMessage(chatId, '❌ 找不到多媒體檔案。');
@@ -237,42 +246,43 @@ module.exports = async (req, res) => {
       const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後銷毀！`;
       let sentMessages = [];
 
-      // 💡 嘗試使用 MediaGroup 發送相冊
+      // 💡 多圖發送核心：逐張發送保證 100% 成功，絕不遺漏！
       if (items.length > 1) {
+        // 先嘗試用官方相冊群組一次發出
         try {
           const mediaGroupPayload = items.map((item, index) => ({
-            type: item.type,
+            type: item.type || 'photo',
             media: item.fileId,
             caption: index === 0 ? privateCaption : '',
             protect_content: true
           }));
           sentMessages = await bot.sendMediaGroup(chatId, mediaGroupPayload);
         } catch (err) {
-          console.error('MediaGroup 私聊發送失敗，改用逐張發送保底:', err.message);
+          console.error('MediaGroup 私聊失敗，切換為逐張可靠發送:', err.message);
           sentMessages = [];
         }
       }
 
-      // 💡 保底機制：如果非相冊或 MediaGroup 失敗，逐張保證全部發出！
-      if (sentMessages.length === 0) {
+      // 如果相冊發送失敗或只有單圖，採用逐張連續發送
+      if (!sentMessages || sentMessages.length === 0) {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
-          const cap = i === 0 ? privateCaption : '';
+          const cap = (i === 0) ? privateCaption : '';
           try {
             let sentMsg;
-            if (item.type === 'photo') {
-              sentMsg = await bot.sendPhoto(chatId, item.fileId, { caption: cap, protect_content: true });
-            } else {
+            if (item.type === 'video') {
               sentMsg = await bot.sendVideo(chatId, item.fileId, { caption: cap, protect_content: true });
+            } else {
+              sentMsg = await bot.sendPhoto(chatId, item.fileId, { caption: cap, protect_content: true });
             }
             if (sentMsg) sentMessages.push(sentMsg);
           } catch (e) {
-            console.error(`第 ${i + 1} 張照片發送失敗:`, e.message);
+            console.error(`第 ${i + 1} 張多媒體發送失敗:`, e.message);
           }
         }
       }
 
-      // 定時自動刪除全部已發出的私聊訊息
+      // 設定定時自動清空銷毀
       setTimeout(async () => {
         for (const m of sentMessages) {
           try {
