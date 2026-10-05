@@ -1,31 +1,23 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
 
-// 自動讀取 Vercel 與 Upstash 連線環境變數
 const redis = Redis.fromEnv();
 
 const token = process.env.BOT_TOKEN || '8894128453:AAHqR_BaE_WN00CKugjh_hqg79dbX_B5iKY';
 const DELETE_DELAY_SECONDS = parseInt(process.env.DELETE_DELAY || '15', 10);
 
-// 💡 1. 你的私人頻道 ID
 const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '-1004320576547'; 
-
-// 💡 2. 申請入谷連結
 const APPLY_GROUP_URL = process.env.APPLY_GROUP_URL || 'https://t.me/+rz1gdgLB7dtlYWE1'; 
-
-// 💡 3. 私人頻道通用邀請連結
 const BACKUP_CHANNEL_URL = process.env.BACKUP_CHANNEL_URL || 'https://t.me/+your_channel_invite_link'; 
 
 const bot = new TelegramBot(token);
 
-// 輔助函式：將 -100XXXXXX 轉為 Telegram 頻道內部跳轉連結格式
 function getChannelMessageLink(channelId, messageId) {
   if (!channelId) return BACKUP_CHANNEL_URL;
   const cleanId = channelId.toString().replace('-100', '');
   return `https://t.me/c/${cleanId}/${messageId}`;
 }
 
-// 輔助函式：格式化時間 (轉為 YYYY-MM-DD HH:mm 格式)
 function formatTimestamp(unixTimestamp) {
   const date = new Date(unixTimestamp * 1000);
   const utc8Date = new Date(date.getTime() + (8 * 60 + date.getTimezoneOffset()) * 60000);
@@ -39,7 +31,6 @@ function formatTimestamp(unixTimestamp) {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
-// 輔助函式：延遲毫秒
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 module.exports = async (req, res) => {
@@ -61,17 +52,15 @@ module.exports = async (req, res) => {
     if (msg && (msg.photo || msg.video)) {
       const chatId = msg.chat.id;
       const messageId = msg.message_id;
-      const caption = msg.caption || ''; // 讀取發圖者的文字
-      const mediaGroupId = msg.media_group_id; // 多張連發時的唯一相冊 ID
-
-      // 1. 抓取發送者資訊
+      const caption = msg.caption || '';
+      
       const sender = msg.from || {};
+      const senderId = sender.id || 'anon';
       const senderName = [sender.first_name, sender.last_name].filter(Boolean).join(' ') || '未知用戶';
       const senderUsername = sender.username ? `@${sender.username}` : '無用戶名';
       const sendTime = formatTimestamp(msg.date);
 
-      // 💡 判斷是否為匿名 Admin (GroupAnonymousBot)
-      const isAnonymousAdmin = sender.username === 'GroupAnonymousBot' || sender.id === 1087968824;
+      const isAnonymousAdmin = sender.username === 'GroupAnonymousBot' || senderId === 1087968824;
 
       let fileId = '';
       let type = 'photo';
@@ -84,133 +73,77 @@ module.exports = async (req, res) => {
         fileId = msg.video.file_id;
       }
 
-      // 先刪除群組內的單張媒體訊息，避免佔用版面
+      // 先刪除原圖
       try {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 如果是「多圖/多影片連發 (Media Group)」
-      if (mediaGroupId) {
-        const groupKey = `album:${mediaGroupId}`;
-        const counterKey = `album_count:${mediaGroupId}`;
+      // 💡 關鍵改變：優先使用 media_group_id，若無則降級為 「chatId + senderId + 時間區段(以10秒為單位)」
+      const timeBlock = Math.floor(msg.date / 5); // 5秒的時間視窗
+      const groupKeyId = msg.media_group_id || `${chatId}_${senderId}_${timeBlock}`;
+      
+      const groupKey = `album:${groupKeyId}`;
+      const counterKey = `album_count:${groupKeyId}`;
 
-        // 1. 將這張圖片/影片寫入 Redis 列表
-        await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
-        await redis.expire(groupKey, 86400);
+      // 1. 推入 Redis
+      await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
+      await redis.expire(groupKey, 86400);
 
-        // 2. 利用原子遞增 (INCR) 鎖定，只有第一個到達的請求 (count === 1) 會負責最終發文
-        const count = await redis.incr(counterKey);
-        await redis.expire(counterKey, 30);
+      // 2. 只有第一個請求發文
+      const count = await redis.incr(counterKey);
+      await redis.expire(counterKey, 15);
 
-        if (count === 1) {
-          // 💡 等待 2.5 秒，確保 8~10 張圖片的 Webhook 請求都完整傳入並寫入 Redis
-          await sleep(2500);
+      if (count === 1) {
+        // 等待 2.5 秒，讓同一次上傳的所有圖片（包含匿名發圖）全部收集進 Redis
+        await sleep(2500);
 
-          // 讀取相冊中累積的所有圖片/影片
-          const rawItems = await redis.lrange(groupKey, 0, -1);
-          const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
+        const rawItems = await redis.lrange(groupKey, 0, -1);
+        const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-          // 尋找相冊中帶有 caption 的文字說明（Telegram 通常附在第一張）
-          const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
+        // 自動掃描所有圖片，找出那張有帶 C: 文字的圖片
+        const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
 
-          const mediaToken = Math.random().toString(36).substring(2, 10);
-          
-          // 💡 將整組媒體 Array 寫入 Redis，永久保存
-          await redis.set(mediaToken, { isGroup: true, items });
-
-          // 動態組合資訊
-          const detailInfoLines = [];
-          if (!isAnonymousAdmin) {
-            detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
-          }
-          detailInfoLines.push(`⏰ **T**：${sendTime}`);
-
-          if (finalCaption.trim()) {
-            detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
-          }
-
-          const detailInfo = detailInfoLines.join('\n');
-          let channelMsgLink = BACKUP_CHANNEL_URL;
-
-          // 同步備份整組相冊至私人頻道
-          if (BACKUP_CHANNEL_ID && items.length > 0) {
-            try {
-              const mediaGroupPayload = items.map((item, index) => ({
-                type: item.type,
-                media: item.fileId,
-                caption: index === 0 ? detailInfo : '', // 僅在第一張照片帶文字
-                parse_mode: 'Markdown'
-              }));
-
-              const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
-              if (backupMsgs && backupMsgs.length > 0) {
-                channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
-              }
-            } catch (e) {
-              console.error('轉發私人頻道相冊失敗:', e.message);
-            }
-          }
-
-          const me = await bot.getMe();
-          const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
-
-          // 發送群組統一按鈕（只會發送「唯一一條」訊息）
-          await bot.sendMessage(chatId, detailInfo, {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: '👁️ 爽看', url: startUrl },
-                  { text: '💬 入谷', url: APPLY_GROUP_URL },
-                  { text: '🍔 谷睇', url: channelMsgLink }
-                ]
-              ]
-            }
-          });
-
-          // 清理相冊快取 Key
-          await redis.del(groupKey);
-          await redis.del(counterKey);
-        }
-      } 
-      // 如果是「單張圖片或單個影片」
-      else {
         const mediaToken = Math.random().toString(36).substring(2, 10);
+        
+        // 寫入 Redis 供私聊「爽看」
+        await redis.set(mediaToken, { isGroup: items.length > 1, items, fileId: items[0].fileId, type: items[0].type });
 
-        // 寫入單一媒體項目，永久保存
-        await redis.set(mediaToken, { isGroup: false, fileId, type });
-
-        // 動態組合資訊
+        // 組合訊息資訊
         const detailInfoLines = [];
         if (!isAnonymousAdmin) {
           detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
         }
         detailInfoLines.push(`⏰ **T**：${sendTime}`);
 
-        if (caption.trim()) {
-          detailInfoLines.push(`💬 **C**：${caption.trim()}`);
+        if (finalCaption.trim()) {
+          detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
         }
 
         const detailInfo = detailInfoLines.join('\n');
         let channelMsgLink = BACKUP_CHANNEL_URL;
 
-        if (BACKUP_CHANNEL_ID) {
+        // 同步備份至私人頻道
+        if (BACKUP_CHANNEL_ID && items.length > 0) {
           try {
-            let backupMsg;
-            if (type === 'photo') {
-              backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, fileId, {
-                caption: detailInfo,
+            if (items.length > 1) {
+              const mediaGroupPayload = items.map((item, index) => ({
+                type: item.type,
+                media: item.fileId,
+                caption: index === 0 ? detailInfo : '',
                 parse_mode: 'Markdown'
-              });
-            } else if (type === 'video') {
-              backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, fileId, {
-                caption: detailInfo,
-                parse_mode: 'Markdown'
-              });
-            }
-
-            if (backupMsg && backupMsg.message_id) {
-              channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
+              }));
+              const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
+              if (backupMsgs && backupMsgs.length > 0) {
+                channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
+              }
+            } else {
+              let backupMsg;
+              if (items[0].type === 'photo') {
+                backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+              } else {
+                backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+              }
+              if (backupMsg) channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
             }
           } catch (e) {
             console.error('轉發私人頻道失敗:', e.message);
@@ -220,6 +153,7 @@ module.exports = async (req, res) => {
         const me = await bot.getMe();
         const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
+        // 發送群組唯一的按鈕訊息
         await bot.sendMessage(chatId, detailInfo, {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -232,15 +166,18 @@ module.exports = async (req, res) => {
             ]
           }
         });
+
+        // 清除快取
+        await redis.del(groupKey);
+        await redis.del(counterKey);
       }
     }
 
-    // 處理私聊 /start (點擊爽看時觸發)
+    // 處理私聊 /start
     if (msg && msg.text && msg.text.startsWith('/start ')) {
       const chatId = msg.chat.id;
       const mediaToken = msg.text.split(' ')[1];
 
-      // 從 Redis 讀取媒體資料
       const data = await redis.get(mediaToken);
 
       if (!data) {
@@ -249,7 +186,6 @@ module.exports = async (req, res) => {
         const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後毀！`;
         let sentMessages = [];
 
-        // 1. 如果是多張相簿/影片
         if (data.isGroup && Array.isArray(data.items)) {
           const mediaGroupPayload = data.items.map((item, index) => ({
             type: item.type,
@@ -259,9 +195,7 @@ module.exports = async (req, res) => {
           }));
 
           sentMessages = await bot.sendMediaGroup(chatId, mediaGroupPayload);
-        } 
-        // 2. 如果是單張圖片/影片
-        else {
+        } else {
           let sentMsg;
           if (data.type === 'photo') {
             sentMsg = await bot.sendPhoto(chatId, data.fileId, {
@@ -277,7 +211,6 @@ module.exports = async (req, res) => {
           if (sentMsg) sentMessages.push(sentMsg);
         }
 
-        // 定時自動銷毀所有私聊媒體訊息
         setTimeout(async () => {
           for (const m of sentMessages) {
             try {
