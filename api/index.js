@@ -89,7 +89,7 @@ module.exports = async (req, res) => {
         fileId = msg.video.file_id;
       }
 
-      // 💡 移除標籤前綴，直接顯示文字內容
+      // 組合訊息內容
       const detailInfoLines = [];
       if (caption.trim()) {
         detailInfoLines.push(`${caption.trim()}`);
@@ -102,7 +102,7 @@ module.exports = async (req, res) => {
       const detailInfo = detailInfoLines.join('\n');
       let channelMsgLink = BACKUP_CHANNEL_URL;
 
-      // 備份至私人頻道
+      // 1. 全部檔案皆進行私人頻道備份
       if (BACKUP_CHANNEL_ID) {
         try {
           let backupMsg;
@@ -117,26 +117,30 @@ module.exports = async (req, res) => {
         }
       }
 
-      // 多圖判斷與提示處理
+      // 2. 多圖原子性鎖定：立刻判斷是否為第一個 Message，非第一個直接結束
       let isFirstInGroup = true;
       if (msg.media_group_id) {
         const groupKey = `mg:${chatId}_${msg.media_group_id}`;
-        isFirstInGroup = await redis.set(groupKey, '1', { nx: true, ex: 10 });
+        // 使用 set nx + ex 確保 10 秒內同一個相冊組只有第一個能拿到的 key 為 '1'
+        const result = await redis.set(groupKey, '1', { nx: true, ex: 10 });
+        if (!result) {
+          isFirstInGroup = false;
+        }
       }
 
-      // 多圖中非第一個檔案僅完成備份，不再發送群組按鈕
+      // 多圖中「非第一個」的檔案，完成備份後立刻 Return，絕對不重複發送群組按鈕
       if (!isFirstInGroup) {
         return res.status(200).send('OK');
       }
 
-      // 第一個檔案：寫入 Redis 供「密看」讀取
+      // 3. 第一個檔案：寫入 Redis 供私聊「密看」讀取
       const mediaToken = Math.random().toString(36).substring(2, 10);
       await redis.set(mediaToken, { fileId, type }, { ex: 86400 });
 
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 發送群組按鈕訊息
+      // 4. 發送群組按鈕（只會發送一次）
       await bot.sendMessage(chatId, detailInfo, {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -150,15 +154,16 @@ module.exports = async (req, res) => {
         }
       });
 
-      // 多圖時發送提示，並於 10 秒後刪除提示訊息
+      // 5. 多圖時發送提示，並非阻塞地在 10 秒後刪除提示訊息
       if (msg.media_group_id) {
-        try {
-          const warnMsg = await bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。');
-          await sleep(10000);
-          await bot.deleteMessage(chatId, warnMsg.message_id);
-        } catch (e) {
-          console.error('刪除提示訊息失敗:', e.message);
-        }
+        bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。').then(async (warnMsg) => {
+          if (warnMsg && warnMsg.message_id) {
+            await sleep(10000);
+            try {
+              await bot.deleteMessage(chatId, warnMsg.message_id);
+            } catch (e) {}
+          }
+        }).catch(() => {});
       }
     }
 
