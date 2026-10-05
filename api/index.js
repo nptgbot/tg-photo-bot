@@ -48,7 +48,6 @@ module.exports = async (req, res) => {
   try {
     const msg = update.message;
 
-    // 處理群組內的「圖片」或「影片」
     if (msg && (msg.photo || msg.video)) {
       const chatId = msg.chat.id;
       const messageId = msg.message_id;
@@ -73,121 +72,127 @@ module.exports = async (req, res) => {
         fileId = msg.video.file_id;
       }
 
-      // 先刪除原圖訊息
       try {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 1. 生成相冊獨立 Key（優先使用 media_group_id，否則以 10 秒區間聚合）
-      const timeBlock = Math.floor(msg.date / 10);
-      const groupKeyId = msg.media_group_id || `${chatId}_${senderId}_${timeBlock}`;
-      
+      // 💡 【核心修復】使用「滑動時間視窗」取代死板的除以 10 區塊
+      let groupKeyId = msg.media_group_id;
+      const sessionKey = `sess:${chatId}_${senderId}`;
+
+      // 如果 Telegram 沒有提供 media_group_id，我們自己建立自動延長的群組
+      if (!groupKeyId) {
+        groupKeyId = await redis.get(sessionKey);
+        if (!groupKeyId) {
+          groupKeyId = `batch_${Date.now()}`;
+        }
+        // 只要 5 秒內有新圖傳進來，就會自動重置計時器並歸入同一組
+        await redis.set(sessionKey, groupKeyId, { ex: 5 });
+      }
+
       const groupKey = `album:${groupKeyId}`;
-      const lastUpdateKey = `album_last:${groupKeyId}`;
-      const processLockKey = `album_proc:${groupKeyId}`;
+      const lockKey = `lock:${groupKeyId}`;
 
-      // 2. 將這張圖片推入 Redis List，並記錄「最後更新時間」
-      const now = Date.now();
+      // 1. 推入 Redis 並確保資料安全保留
       await redis.rpush(groupKey, JSON.stringify({ fileId, type, caption }));
-      await redis.set(lastUpdateKey, now);
-      await redis.expire(groupKey, 3600);
-      await redis.expire(lastUpdateKey, 3600);
+      await redis.expire(groupKey, 86400);
 
-      // 3. 嘗試取得處理鎖 (Set NX)，只有拿到的那個請求會負責監控與發文
-      const acquiredLock = await redis.set(processLockKey, 'processing', { nx: true, ex: 60 });
+      // 2. 選出唯一負責發送的「主控請求」
+      const isMaster = await redis.set(lockKey, 'locked', { nx: true, ex: 15 });
 
-      if (acquiredLock) {
-        // 進入 Debounce 輪詢：直到 2.0 秒內沒有任何新的圖片進來為止
-        while (true) {
-          await sleep(2000);
-          const lastTime = await redis.get(lastUpdateKey);
-          if (!lastTime || Date.now() - parseInt(lastTime, 10) >= 1800) {
-            // 已經超過 1.8 秒沒有新圖片寫入，表示這組相冊全部接收完成！
-            break;
+      if (isMaster) {
+        // 主控端單純等待 4 秒鐘，讓背後其他圖片全都裝進同一個 Redis 箱子
+        await sleep(4000);
+
+        // 如果是我們自己建的 Session，提前關閉它，確保未來的圖不會混進來
+        if (!msg.media_group_id) {
+          const currentSession = await redis.get(sessionKey);
+          if (currentSession === groupKeyId) {
+            await redis.del(sessionKey);
           }
         }
 
-        // 讀取相冊中收集到的所有多媒體資料
+        // 一口氣把 4 秒內收集到的所有圖拿出來
         const rawItems = await redis.lrange(groupKey, 0, -1);
+        if (!rawItems || rawItems.length === 0) return res.status(200).send('OK');
+
         const items = rawItems.map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-        if (items && items.length > 0) {
-          // 找出含有 C: 文字說明的相片
-          const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
+        // 自動掃描並抓取那一張有文字的 C:
+        const finalCaption = items.find(i => i.caption && i.caption.trim())?.caption || '';
 
-          const mediaToken = Math.random().toString(36).substring(2, 10);
-          
-          // 寫入 Redis 供私聊「爽看」
-          await redis.set(mediaToken, { isGroup: items.length > 1, items, fileId: items[0].fileId, type: items[0].type });
+        const mediaToken = Math.random().toString(36).substring(2, 10);
+        
+        // 寫入 Redis 供私聊「爽看」 (記錄是否為多圖)
+        await redis.set(mediaToken, { 
+          isGroup: items.length > 1, 
+          items, 
+          fileId: items[0].fileId, 
+          type: items[0].type 
+        });
 
-          // 組合資訊
-          const detailInfoLines = [];
-          if (!isAnonymousAdmin) {
-            detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
-          }
-          detailInfoLines.push(`⏰ **T**：${sendTime}`);
+        const detailInfoLines = [];
+        if (!isAnonymousAdmin) {
+          detailInfoLines.push(`👤 **P**：${senderName} (${senderUsername})`);
+        }
+        detailInfoLines.push(`⏰ **T**：${sendTime}`);
 
-          if (finalCaption.trim()) {
-            detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
-          }
-
-          const detailInfo = detailInfoLines.join('\n');
-          let channelMsgLink = BACKUP_CHANNEL_URL;
-
-          // 同步轉發至私人頻道
-          if (BACKUP_CHANNEL_ID) {
-            try {
-              if (items.length > 1) {
-                const mediaGroupPayload = items.map((item, index) => ({
-                  type: item.type,
-                  media: item.fileId,
-                  caption: index === 0 ? detailInfo : '',
-                  parse_mode: 'Markdown'
-                }));
-                const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
-                if (backupMsgs && backupMsgs.length > 0) {
-                  channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
-                }
-              } else {
-                let backupMsg;
-                if (items[0].type === 'photo') {
-                  backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
-                } else {
-                  backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
-                }
-                if (backupMsg) channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
-              }
-            } catch (e) {
-              console.error('轉發私人頻道失敗:', e.message);
-            }
-          }
-
-          const me = await bot.getMe();
-          const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
-
-          // 發送群組唯一的按鈕訊息
-          await bot.sendMessage(chatId, detailInfo, {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: '👁️ 密看', url: startUrl },
-                  { text: '💬 入谷', url: APPLY_GROUP_URL },
-                  { text: '🍔 谷睇', url: channelMsgLink }
-                ]
-              ]
-            }
-          });
+        if (finalCaption.trim()) {
+          detailInfoLines.push(`💬 **C**：${finalCaption.trim()}`);
         }
 
-        // 徹底清理這些鍵值，防重複觸發
+        const detailInfo = detailInfoLines.join('\n');
+        let channelMsgLink = BACKUP_CHANNEL_URL;
+
+        if (BACKUP_CHANNEL_ID) {
+          try {
+            if (items.length > 1) {
+              const mediaGroupPayload = items.map((item, index) => ({
+                type: item.type,
+                media: item.fileId,
+                caption: index === 0 ? detailInfo : '',
+                parse_mode: 'Markdown'
+              }));
+              const backupMsgs = await bot.sendMediaGroup(BACKUP_CHANNEL_ID, mediaGroupPayload);
+              if (backupMsgs && backupMsgs.length > 0) {
+                channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsgs[0].message_id);
+              }
+            } else {
+              let backupMsg;
+              if (items[0].type === 'photo') {
+                backupMsg = await bot.sendPhoto(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+              } else {
+                backupMsg = await bot.sendVideo(BACKUP_CHANNEL_ID, items[0].fileId, { caption: detailInfo, parse_mode: 'Markdown' });
+              }
+              if (backupMsg) channelMsgLink = getChannelMessageLink(BACKUP_CHANNEL_ID, backupMsg.message_id);
+            }
+          } catch (e) {
+            console.error('轉發私人頻道失敗:', e.message);
+          }
+        }
+
+        const me = await bot.getMe();
+        const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
+
+        // 🌟 最終保證：只發送唯一一條整合好的按鈕訊息！
+        await bot.sendMessage(chatId, detailInfo, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '👁️ 密看', url: startUrl },
+                { text: '💬 入谷', url: APPLY_GROUP_URL },
+                { text: '🍔 谷睇', url: channelMsgLink }
+              ]
+            ]
+          }
+        });
+
+        // 處理完畢清空箱子
         await redis.del(groupKey);
-        await redis.del(lastUpdateKey);
-        await redis.del(processLockKey);
       }
     }
 
-    // 處理私聊 /start
     if (msg && msg.text && msg.text.startsWith('/start ')) {
       const chatId = msg.chat.id;
       const mediaToken = msg.text.split(' ')[1];
