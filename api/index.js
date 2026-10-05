@@ -76,24 +76,27 @@ module.exports = async (req, res) => {
         await bot.deleteMessage(chatId, messageId);
       } catch (e) {}
 
-      // 💡 功能 1：檢測到用戶一次性上載多個圖/影片 (帶有 media_group_id)
+      // 💡 檢測到多圖/影片上載時：攔截後續檔案，僅放行第一個檔案並跳出提示
       if (msg.media_group_id) {
-        const warnKey = `warn:${chatId}_${msg.media_group_id}`;
-        // 使用 Redis 確保同一次多圖上載只發送一次提示，避免頻繁刷屏
-        const hasWarned = await redis.set(warnKey, '1', { nx: true, ex: 10 });
-        
-        if (hasWarned) {
-          const warnMsg = await bot.sendMessage(chatId, '⚠️ **檢測到一次性上載多個檔案！**\n本 Bot 僅支援單張圖片/影片上載，請改為**分批單獨上載**。', { parse_mode: 'Markdown' });
-          
-          // 1 分鐘 (60 秒) 後自動刪除提示訊息
+        const groupKey = `mg:${chatId}_${msg.media_group_id}`;
+        // 利用 Redis 判斷是否為同一次上載的第一個 Message
+        const isFirst = await redis.set(groupKey, '1', { nx: true, ex: 10 });
+
+        if (!isFirst) {
+          // 非第一個檔案直接丟棄不處理
+          return res.status(200).send('OK');
+        }
+
+        // 發送提示訊息（只發送一次）
+        bot.sendMessage(chatId, '僅支援單張圖片/影片上載，請改為分批單獨上載。').then(warnMsg => {
+          // 💡 10 秒後自動刪除提示訊息
           setTimeout(async () => {
             try { await bot.deleteMessage(chatId, warnMsg.message_id); } catch (e) {}
-          }, 60000);
-        }
-        return res.status(200).send('OK');
+          }, 10000);
+        }).catch(() => {});
       }
 
-      // 處理單圖 / 單影片
+      // 處理第一個檔案（或單檔上載）
       let fileId = '';
       let type = 'photo';
 
