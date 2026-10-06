@@ -121,26 +121,25 @@ module.exports = async (req, res) => {
       let isFirstInGroup = true;
       if (msg.media_group_id) {
         const groupKey = `mg:${chatId}_${msg.media_group_id}`;
-        // 使用 set nx + ex 確保 10 秒內同一個相冊組只有第一個能拿到的 key 為 '1'
         const result = await redis.set(groupKey, '1', { nx: true, ex: 10 });
         if (!result) {
           isFirstInGroup = false;
         }
       }
 
-      // 多圖中「非第一個」的檔案，完成備份後立刻 Return，絕對不重複發送群組按鈕
+      // 多圖中「非第一個」的檔案，完成備份後立刻 Return
       if (!isFirstInGroup) {
         return res.status(200).send('OK');
       }
 
-      // 3. 第一個檔案：寫入 Redis 供私聊「密看」讀取
+      // 3. 第一個檔案：寫入 Redis (統一用 JSON.stringify 確保格式 100% 穩定)
       const mediaToken = Math.random().toString(36).substring(2, 10);
-      await redis.set(mediaToken, { fileId, type }, { ex: 86400 });
+      await redis.set(mediaToken, JSON.stringify({ fileId, type }), { ex: 86400 });
 
       const me = await bot.getMe();
       const startUrl = `https://t.me/${me.username}?start=${mediaToken}`;
 
-      // 4. 發送群組按鈕（只會發送一次，不帶任何提示訊息）
+      // 4. 發送群組按鈕
       await bot.sendMessage(chatId, detailInfo, {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -175,19 +174,33 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK');
       }
 
-      const data = await redis.get(mediaToken);
-      if (!data) {
+      let rawData = await redis.get(mediaToken);
+      if (!rawData) {
         await bot.sendMessage(chatId, '❌ 該檔案已過期或已被清理。');
+        return res.status(200).send('OK');
+      }
+
+      // 💡 關鍵修復：安全解析 Redis 資料，確保不會因為格式轉化失敗而發不出圖片
+      let data = rawData;
+      if (typeof rawData === 'string') {
+        try { data = JSON.parse(rawData); } catch (e) {}
+      }
+
+      const fileId = data.fileId || (data.items && data.items[0] && data.items[0].fileId);
+      const type = data.type || (data.items && data.items[0] && data.items[0].type) || 'photo';
+
+      if (!fileId) {
+        await bot.sendMessage(chatId, '❌ 找不到多媒體檔案。');
         return res.status(200).send('OK');
       }
 
       const privateCaption = `🔒 ${DELETE_DELAY_SECONDS} 秒後銷毀！`;
       let sentMsg;
 
-      if (data.type === 'video') {
-        sentMsg = await bot.sendVideo(chatId, data.fileId, { caption: privateCaption, protect_content: true });
+      if (type === 'video') {
+        sentMsg = await bot.sendVideo(chatId, fileId, { caption: privateCaption, protect_content: true });
       } else {
-        sentMsg = await bot.sendPhoto(chatId, data.fileId, { caption: privateCaption, protect_content: true });
+        sentMsg = await bot.sendPhoto(chatId, fileId, { caption: privateCaption, protect_content: true });
       }
 
       // 私聊定時自動銷毀
